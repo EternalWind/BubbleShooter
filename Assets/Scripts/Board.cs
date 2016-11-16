@@ -152,65 +152,106 @@ public class Board : MonoBehaviour
             && grid_coordinate.y >= 0 && grid_coordinate.y < boardHeightInBubbleRows;
     }
 
-    private bool CollisionTest(Bubble bubble, out BubbleCollision collision)
+    private BubbleCollision BubbleMarching(Vector2 start, Vector2 dir, float step)
     {
-        var grid_coordinate = Local2Grid(bubble.transform.localPosition);
-        collision = null;
+        BubbleCollision result = null;
+        var current = start;
 
-        if (IsGridCoordValid(grid_coordinate))
+        if (dir == Vector2.zero)
         {
-            Vector2[] neighbourGridOffsets = ((int)grid_coordinate.y & 1) == 0 ?
-                neighbourGridOffsetsForEvenRow : neighbourGridOffsetsForOddRow;
+            return null;
+        }
 
-            var potential_collisions = new List<KeyValuePair<Vector2, float>>();
+        while (true)
+        {
+            current += dir * step;
 
-            foreach (var offset in neighbourGridOffsets)
+            if (current.magnitude > 1000)
             {
-                var neighbour_grid_coord = grid_coordinate + offset;
-                var neighbour_local_coord = Grid2Local(neighbour_grid_coord);
-                var distance_between_bubble_and_neighbour = Vector2.Distance(bubble.transform.localPosition, neighbour_local_coord);
-
-                if (distance_between_bubble_and_neighbour <= collideThreshold * bubbleRadius * 2
-                    && neighbour_grid_coord.y < boardHeightInBubbleRows /* Nothing would happen even if the bubble collides with the bottom wall */)
+                return new BubbleCollision
                 {
-                    potential_collisions.Add(new KeyValuePair<Vector2, float>(neighbour_grid_coord,
-                        distance_between_bubble_and_neighbour));
-                }
+                    isSticking = false,
+                    grid = Local2Grid(current)
+                };
             }
 
-            var prioritized_potential_colliders_grid = potential_collisions.OrderBy(t => t.Value).Select(t => t.Key);
-
-            foreach (var potential_collider_grid in prioritized_potential_colliders_grid)
+            if (CollisionTest(current, dir, out result))
             {
-                var is_colliding_with_upper_wall = potential_collider_grid.y < 0.0f;
-                var is_colliding_with_left_wall = potential_collider_grid.x < 0.0f;
-                var is_colliding_with_right_wall = potential_collider_grid.x >= bubblesPerRow;
-                var is_colliding_with_side_walls = is_colliding_with_left_wall || is_colliding_with_right_wall;
-
-                if (is_colliding_with_side_walls)
+                if (Local2Grid(start) == Local2Grid(Grid2Local(result.grid)))
                 {
-                    // Colliding with a wall...
-                    collision = new BubbleCollision
-                    {
-                        isSticking = false,
-                        grid = grid_coordinate,
-                        collidingPointNormal = is_colliding_with_left_wall ? Vector2.right : Vector2.left
-                    };
-
-                    return true;
+                    Debug.Log("!!!");
                 }
-                else if (is_colliding_with_upper_wall || slots[Grid2Index(potential_collider_grid)] != null)
+
+                return result;
+            }
+        }
+    }
+
+    private bool IsSlotIndexValid(int index)
+    {
+        return index >= 0 && index < slots.Length;
+    }
+
+    private bool CollisionTest(Vector3 local, Vector2 dir, out BubbleCollision collision)
+    {
+        var grid_coordinate = Local2Grid(local);
+        collision = null;
+
+        Vector2[] neighbourGridOffsets = ((int)grid_coordinate.y & 1) == 0 ?
+            neighbourGridOffsetsForEvenRow : neighbourGridOffsetsForOddRow;
+
+        var potential_collisions = new List<KeyValuePair<Vector2, float>>();
+        var p2 = new List<KeyValuePair<Vector2, float>>();
+
+        foreach (var offset in neighbourGridOffsets)
+        {
+            var neighbour_grid_coord = grid_coordinate + offset;
+            var neighbour_local_coord = Grid2Local(neighbour_grid_coord);
+            var distance_between_bubble_and_neighbour = Vector2.Distance(local, neighbour_local_coord);
+
+            if (distance_between_bubble_and_neighbour < bubbleRadius * 2 * collideThreshold)
+            {
+                potential_collisions.Add(new KeyValuePair<Vector2, float>(neighbour_grid_coord,
+                    distance_between_bubble_and_neighbour));
+                p2.Add(new KeyValuePair<Vector2, float>(neighbour_local_coord, distance_between_bubble_and_neighbour));
+            }
+        }
+
+        var prioritized_potential_colliders_grid = potential_collisions.OrderBy(t => t.Value).Select(t => t.Key).ToArray();
+        var p22 = p2.OrderBy(t => t.Value).Select(t => t.Key).ToArray();
+
+        foreach (var potential_collider_grid in prioritized_potential_colliders_grid)
+        {
+            var is_colliding_with_upper_wall = potential_collider_grid.y < 0.0f;
+            var is_colliding_with_left_wall = potential_collider_grid.x < 0.0f && dir.x < 0.0f;
+            var is_colliding_with_right_wall = potential_collider_grid.x >= bubblesPerRow && dir.x > 0.0f;
+            var is_colliding_with_side_walls = is_colliding_with_left_wall || is_colliding_with_right_wall;
+
+            var slot_index = Grid2Index(potential_collider_grid);
+
+            if (is_colliding_with_side_walls)
+            {
+                // Colliding with a wall...
+                collision = new BubbleCollision
                 {
-                    // Colliding with another bubble...
-                    collision = new BubbleCollision
-                    {
-                        isSticking = true,
-                        grid = grid_coordinate,
-                        collidingPointNormal = Vector3.zero
-                    };
+                    isSticking = false,
+                    grid = grid_coordinate,
+                    collidingPointNormal = is_colliding_with_left_wall ? Vector2.right : Vector2.left
+                };
 
-                    return true;
-                }
+                return true;
+            }
+            else if (is_colliding_with_upper_wall || IsSlotIndexValid(slot_index) && slots[slot_index] != null)
+            {
+                // Colliding with another bubble...
+                collision = new BubbleCollision
+                {
+                    isSticking = true,
+                    grid = grid_coordinate,
+                    collidingPointNormal = Vector3.zero
+                };
+
+                return true;
             }
         }
 
@@ -239,31 +280,67 @@ public class Board : MonoBehaviour
         }
     }
 
+    private IEnumerator MoveTo(Transform obj, Vector2 target, float speed)
+    {
+        while ((Vector2)obj.localPosition != target)
+        {
+            obj.localPosition = Vector2.MoveTowards(obj.localPosition,
+                target, speed * Time.deltaTime);
+
+            yield return null;
+        }
+
+        yield break;
+    }
+
     private IEnumerator ShootImpl(Vector2 dir, Bubble bubble)
     {
         canShoot = false;
 
-        while (true)
+        var waypoints = new List<Vector2>();
+
+        BubbleCollision collision = BubbleMarching(bubble.transform.localPosition, dir, bubbleRadius);
+
+        var current_waypoint = (Vector2)bubble.transform.localPosition;
+        waypoints.Add(Grid2Local(collision.grid));
+
+        while (!collision.isSticking)
         {
-            bubble.transform.Translate(dir * bubbleShootingSpeed * Time.deltaTime);
+            dir = Vector2.Reflect((waypoints.Last() - current_waypoint).normalized, collision.collidingPointNormal);
+            collision = BubbleMarching(waypoints.Last(), dir, bubbleRadius);
+            current_waypoint = waypoints.Last();
+            waypoints.Add(Grid2Local(collision.grid));
+        }
 
-            BubbleCollision collision = null;
-            if (CollisionTest(bubble, out collision))
+        if (!collision.isSticking)
+        {
+            var start = bubble.transform.localPosition;
+
+            foreach (var end in waypoints)
             {
-                if (collision.isSticking)
-                {
-                    bubble.transform.localPosition = Grid2Local(collision.grid);
-                    slots[Grid2Index(collision.grid)] = new BubbleSlot { bubble = bubble };
-                }
-                else
-                {
-                    yield return StartCoroutine(ShootImpl(Vector2.Reflect(dir, collision.collidingPointNormal), bubble));
-                }
-
-                break;
+                Debug.DrawLine(transform.position + start, transform.position + (Vector3)end, Color.cyan, 5.0f);
+                start = end;
             }
 
-            yield return null;
+            canShoot = true;
+
+            yield break;
+        }
+        else
+        {
+            if (collision.grid.y < boardHeightInBubbleRows)
+            {
+                slots[Grid2Index(collision.grid)] = new BubbleSlot { bubble = bubble };
+            }
+            else
+            {
+                Debug.Log("You lose!");
+            }
+        }
+
+        foreach (var current_end in waypoints)
+        {
+            yield return StartCoroutine(MoveTo(bubble.transform, current_end, bubbleShootingSpeed));
         }
 
         canShoot = true;
@@ -289,10 +366,14 @@ public class Board : MonoBehaviour
                 var canon_position = canon.transform.position;
 
                 var fire_direction = click_position - canon_position;
-                fire_direction = (fire_direction != Vector3.zero) ? fire_direction.normalized : Vector3.up;
 
-                Shoot(fire_direction, nextBubble);
-                ReloadCanon();
+                if (fire_direction.y > 0.0f)
+                {
+                    fire_direction = (fire_direction != Vector3.zero) ? fire_direction.normalized : Vector3.up;
+
+                    Shoot(fire_direction, nextBubble);
+                    ReloadCanon();
+                }
             }
         }
     }
