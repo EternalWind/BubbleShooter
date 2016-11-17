@@ -2,12 +2,15 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
+using System;
 
 public class Board : MonoBehaviour
 {
     public class BubbleSlot
     {
         public Bubble bubble;
+        public int generation = 0;
     }
 
     public class BubbleCollision
@@ -17,14 +20,21 @@ public class Board : MonoBehaviour
         public Vector2 collidingPointNormal;
     }
 
+    public Bubble.BubbleType[] bubbleTypes;
+
     public int bubblesPerRow = 9;
     public int boardHeightInBubbleRows = 13;
     public float bubbleRadius = 0.5f;
     public float bubbleShootingSpeed = 2f;
+    public int bubbleChainThreshold = 3;
+    public float dropTo = -5f;
+    public float dropSpeed = 15f;
 
     public GameObject canon;
 
     public Bubble bubblePrefab;
+
+    private int currentBubbleGeneration = 0;
 
     private BubbleSlot[] slots;
     private float hexagonSize;
@@ -44,10 +54,31 @@ public class Board : MonoBehaviour
     private Vector2[] neighbourGridOffsetsForOddRow
         = { new Vector2(-1, 0), new Vector2(0, -1), new Vector2(1, -1), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1) };
 
+    private void FloodFill(int col, int row, Predicate<BubbleSlot> should_process, Action<BubbleSlot> process)
+    {
+        if (col < 0 || col >= bubblesPerRow || row < 0 || row >= boardHeightInBubbleRows) return;
+
+        var slot_idx = col + row * bubblesPerRow;
+
+        if (!should_process(slots[slot_idx])) return;
+
+        process(slots[slot_idx]);
+
+        var neighbour_grid_offsets = (row & 1) == 1 ? neighbourGridOffsetsForOddRow : neighbourGridOffsetsForEvenRow;
+        foreach (var neighbour_grid_offset in neighbour_grid_offsets)
+        {
+            FloodFill(col + (int)neighbour_grid_offset.x, row + (int)neighbour_grid_offset.y, should_process, process);
+        }
+    }
+
     // Use this for initialization
     void Start()
     {
         slots = new BubbleSlot[bubblesPerRow * boardHeightInBubbleRows];
+        for (var i = 0; i < slots.Length; ++i)
+        {
+            slots[i] = new BubbleSlot();
+        }
 
         hexagonSize = bubbleRadius / Mathf.Cos(Mathf.Deg2Rad * 30.0f);
         var hexagonHeight = hexagonSize * 2;
@@ -56,12 +87,77 @@ public class Board : MonoBehaviour
         rightBoarder = leftBoarder + bubbleRadius * bubblesPerRow * 2 + bubbleRadius;
         bottomBoarder = topBoarder - (boardHeightInBubbleRows - 1) * hexagonVerticalDistance - hexagonSize * 2;
 
+        LoadBubblesFromFile(Path.Combine(Directory.GetCurrentDirectory(), "bubbles.txt"));
+        ArrangeBubblesInSlots();
+
         ReloadCanon();
     }
 
-    private Bubble GenerateRandomBubble()
+    private void LoadBubblesFromFile(string file_path)
     {
-        return Instantiate(bubblePrefab);
+        if (File.Exists(file_path))
+        {
+            using (var fs = new StreamReader(file_path))
+            {
+                var row = 0;
+
+                while (!fs.EndOfStream && row < boardHeightInBubbleRows)
+                {
+                    var bubble_strs = fs.ReadLine().Split(' ');
+
+                    var col = 0;
+                    for (var i = 0; i < bubble_strs.Length && col < bubblesPerRow; ++i, ++col)
+                    {
+                        var bubble_type_idx = int.Parse(bubble_strs[i]);
+                        if (bubble_type_idx >= 0 && bubble_type_idx < bubbleTypes.Length)
+                        {
+                            var bubble = GenerateBubble(bubble_type_idx);
+                            var slot_idx = col + row * bubblesPerRow;
+
+                            slots[slot_idx].bubble = bubble;
+                        }
+                    }
+
+                    row++;
+                }
+            }
+        }
+        else
+        {
+            Debug.LogError("The file you want to read from does not exist!");
+        }
+    }
+
+    private void ArrangeBubblesInSlots()
+    {
+        for (int row = 0; row < boardHeightInBubbleRows; ++row)
+        {
+            for (int col = 0; col < bubblesPerRow; ++col)
+            {
+                var slot_idx = col + row * bubblesPerRow;
+                var local = Grid2Local(new Vector2(col, row));
+
+                if (slots[slot_idx].bubble != null)
+                {
+                    slots[slot_idx].bubble.transform.localPosition = local;
+                }
+            }
+        }
+    }
+
+    private Bubble GenerateBubble(int type_idx = -1)
+    {
+        if (type_idx < 0)
+        {
+            type_idx = UnityEngine.Random.Range(0, bubbleTypes.Length);
+        }
+
+        var bubble = Instantiate(bubblePrefab);
+        bubble.type = bubbleTypes[type_idx];
+        bubble.GetComponent<SpriteRenderer>().color = bubble.type.color;
+        bubble.transform.SetParent(transform);
+
+        return bubble;
     }
 
     private void Shoot(Vector2 dir, Bubble bubble)
@@ -241,7 +337,7 @@ public class Board : MonoBehaviour
 
                 return true;
             }
-            else if (is_colliding_with_upper_wall || IsSlotIndexValid(slot_index) && slots[slot_index] != null)
+            else if (is_colliding_with_upper_wall || IsSlotIndexValid(slot_index) && slots[slot_index].bubble != null)
             {
                 // Colliding with another bubble...
                 collision = new BubbleCollision
@@ -293,11 +389,64 @@ public class Board : MonoBehaviour
         yield break;
     }
 
+    private List<BubbleSlot> CollectChainedBubbleSlots(int starting_col, int starting_row, Bubble.BubbleType chaining_type)
+    {
+        var chained_bubble_slots = new List<BubbleSlot>();
+        FloodFill(starting_col, starting_row,
+            slot => slot.bubble != null && slot.bubble.type == chaining_type && !chained_bubble_slots.Contains(slot),
+            slot =>
+            {
+                chained_bubble_slots.Add(slot);
+            });
+
+        return chained_bubble_slots;
+    }
+
+    private IEnumerable<BubbleSlot> CollectDroppingBubbleSlots(int next_bubble_generation)
+    {
+        for (int col = 0; col < bubblesPerRow; ++col)
+        {
+            FloodFill(col, 0,
+                slot => slot.bubble != null && slot.generation != next_bubble_generation,
+                slot =>
+                {
+                    slot.generation = next_bubble_generation;
+                });
+        }
+
+        var dropping_bubble_slots = slots.Where(s => s.bubble != null && s.generation < next_bubble_generation);
+
+        return dropping_bubble_slots;
+    }
+
+    private IEnumerator Explode(Bubble bubble)
+    {
+        Destroy(bubble.gameObject);
+        yield break;
+    }
+
+    private IEnumerator Drop(Bubble bubble)
+    {
+        while (bubble.transform.position.y > dropTo)
+        {
+            bubble.transform.position = Vector2.MoveTowards(bubble.transform.position, 
+                new Vector2(bubble.transform.position.x, dropTo), dropSpeed * Time.deltaTime);
+
+            yield return null;
+        }
+
+        Destroy(bubble.gameObject);
+        yield break;
+    }
+
     private IEnumerator ShootImpl(Vector2 dir, Bubble bubble)
     {
         canShoot = false;
 
         var waypoints = new List<Vector2>();
+
+        var chained_bubbles = new List<Bubble>();
+        var dropping_bubbles = new List<Bubble>();
 
         BubbleCollision collision = BubbleMarching(bubble.transform.localPosition, dir, bubbleRadius);
 
@@ -330,7 +479,26 @@ public class Board : MonoBehaviour
         {
             if (collision.grid.y < boardHeightInBubbleRows)
             {
-                slots[Grid2Index(collision.grid)] = new BubbleSlot { bubble = bubble };
+                slots[Grid2Index(collision.grid)].bubble = bubble;
+                slots[Grid2Index(collision.grid)].generation = currentBubbleGeneration;
+
+                var chained_bubble_slots = CollectChainedBubbleSlots((int)collision.grid.x, (int)collision.grid.y, bubble.type);
+
+                if (chained_bubble_slots.Count >= bubbleChainThreshold)
+                {
+                    foreach (var slot in chained_bubble_slots)
+                    {
+                        chained_bubbles.Add(slot.bubble);
+                        slot.bubble = null;
+                    }
+
+                    var dropping_bubble_slots = CollectDroppingBubbleSlots(++currentBubbleGeneration);
+                    foreach (var slot in dropping_bubble_slots)
+                    {
+                        dropping_bubbles.Add(slot.bubble);
+                        slot.bubble = null;
+                    }
+                }
             }
             else
             {
@@ -343,6 +511,16 @@ public class Board : MonoBehaviour
             yield return StartCoroutine(MoveTo(bubble.transform, current_end, bubbleShootingSpeed));
         }
 
+        foreach (var cb in chained_bubbles)
+        {
+            StartCoroutine(Explode(cb));
+        }
+
+        foreach (var db in dropping_bubbles)
+        {
+            StartCoroutine(Drop(db));
+        }
+
         canShoot = true;
 
         yield break;
@@ -350,9 +528,8 @@ public class Board : MonoBehaviour
 
     private void ReloadCanon()
     {
-        nextBubble = GenerateRandomBubble();
+        nextBubble = GenerateBubble();
         nextBubble.transform.position = canon.transform.position;
-        nextBubble.transform.SetParent(this.transform);
     }
 
     // Update is called once per frame
